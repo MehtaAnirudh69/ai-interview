@@ -1,5 +1,5 @@
 from uuid import uuid4
-
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.concurrency import run_in_threadpool
 
@@ -24,7 +24,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # Temporary storage for today's implementation.
 # Day 4 will replace this with SQLite.
 interview_sessions = {}
