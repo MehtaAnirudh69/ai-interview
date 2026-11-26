@@ -15,7 +15,7 @@ from app.schemas import (
     AnswerEvaluationResponse,
 )
 from app.llm_service import generate_questions, evaluate_answer, LLMBusyError
-from app.rag_service import retrieve_relevant_questions
+from app.rag_service import retrieve_relevant_questions, retrieve_answer_chunks
 
 
 app = FastAPI(
@@ -34,6 +34,40 @@ app.add_middleware(
 # Temporary storage for today's implementation.
 # Day 4 will replace this with SQLite.
 interview_sessions = {}
+
+
+def _normalize(text: str) -> str:
+    """Normalize question text so it can be used as a lookup key."""
+    return " ".join(text.lower().split())
+
+
+def _build_reference(session: dict, question: str):
+    """
+    Choose the grading reference for a question.
+
+    1. RAG: retrieve matching chunks from the curated question bank.
+    2. Fallback: the answer key Gemini wrote when it generated the question.
+    3. Otherwise (None, None): the evaluator grades without a reference.
+    """
+    try:
+        chunks = retrieve_answer_chunks(question, top_k=3)
+    except Exception as exc:
+        print(f"Answer-chunk retrieval failed, using fallback: {exc}")
+        chunks = []
+
+    if chunks:
+        reference = "\n".join(chunk["text"] for chunk in chunks)
+
+        concepts = []
+        for chunk in chunks:
+            for concept in chunk["concepts"]:
+                if concept not in concepts:
+                    concepts.append(concept)
+
+        return reference, concepts
+
+    key = session.get("answer_keys", {}).get(_normalize(question), {})
+    return key.get("reference_answer"), key.get("key_concepts")
 
 
 @app.get("/")
@@ -59,7 +93,8 @@ def create_interview(data: InterviewCreate):
         "job_description": data.job_description,
         "difficulty": data.difficulty,
         "num_questions": data.num_questions,
-        "questions": [],
+        "questions": [],       # public questions sent to the candidate
+        "answer_keys": {},     # hidden reference answers, keyed by question
     }
 
     return InterviewResponse(
@@ -196,8 +231,8 @@ def create_questions(session_id: str):
             detail="Interview session not found",
         )
 
-    # Retrieval is a bonus: if it fails, still generate questions
-    # from the job description alone.
+    # Step 1: RAG retrieval. This is a bonus: if it fails, still generate
+    # questions from the job description alone.
     try:
         retrieved_context = retrieve_relevant_questions(
             job_title=session["job_title"],
@@ -209,8 +244,9 @@ def create_questions(session_id: str):
         print(f"Question retrieval failed, continuing without context: {exc}")
         retrieved_context = []
 
+    # Step 2: Generate questions grounded in the retrieved context.
     try:
-        questions = generate_questions(
+        generated = generate_questions(
             job_title=session["job_title"],
             job_description=session["job_description"],
             difficulty=session["difficulty"],
@@ -231,11 +267,25 @@ def create_questions(session_id: str):
             detail="Could not generate questions. Check the AI configuration and try again.",
         ) from exc
 
-    session["questions"] = questions
+    # Step 3: Split into what the candidate sees and the hidden answer key.
+    public_questions = []
+    answer_keys = {}
+
+    for item in generated:
+        public_questions.append(
+            {"question": item["question"], "topic": item["topic"]}
+        )
+        answer_keys[_normalize(item["question"])] = {
+            "reference_answer": item["reference_answer"],
+            "key_concepts": item["key_concepts"],
+        }
+
+    session["questions"] = public_questions
+    session["answer_keys"] = answer_keys  # replaced on every regeneration
 
     return QuestionListResponse(
         session_id=session_id,
-        questions=questions,
+        questions=public_questions,
     )
 
 
@@ -255,12 +305,17 @@ def evaluate_candidate_answer(
             detail="Interview session not found",
         )
 
+    # RAG first (retrieved bank chunks), then the Gemini-written answer key.
+    reference_answer, key_concepts = _build_reference(session, data.question)
+
     try:
         result = evaluate_answer(
             job_title=session["job_title"],
             question=data.question,
             answer=data.answer,
             difficulty=session["difficulty"],
+            reference_answer=reference_answer,
+            key_concepts=key_concepts,
         )
 
         return AnswerEvaluationResponse.model_validate(result)
